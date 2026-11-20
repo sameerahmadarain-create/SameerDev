@@ -16,6 +16,11 @@ import {
   type Unsubscribe,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import {
+  isSupabaseConfigured,
+  supabase,
+  uploadImageToSupabaseStorage,
+} from '../lib/supabase';
 import { Project, ScreenshotSource } from '../types';
 import { SEED_PROJECTS } from '../data/seedProjects';
 
@@ -103,7 +108,7 @@ function clampTechnologies(list: string[] | undefined): string[] | undefined {
 }
 
 /**
- * Validates and sanitizes a raw object to ensure it conforms to Project structure.
+ * Validates and sanitizes a raw object (from Firestore, Supabase, or localStorage).
  */
 function sanitizeProject(item: unknown): Project | null {
   if (!item || typeof item !== 'object') return null;
@@ -113,6 +118,11 @@ function sanitizeProject(item: unknown): Project | null {
   if (typeof p.name !== 'string' || !p.name.trim()) return null;
 
   const url = typeof p.url === 'string' ? p.url.trim() : '';
+  const rawSource = (p.screenshotSource ?? p.screenshot_source) as string | undefined;
+  const rawPublished = p.isPublished ?? p.is_published;
+  const rawOwner = (p.ownerId ?? p.owner_id) as string | undefined;
+  const rawCreatedAt = p.createdAt ?? p.created_at;
+  const rawUpdatedAt = p.updatedAt ?? p.updated_at;
 
   return {
     id: p.id.trim(),
@@ -120,18 +130,19 @@ function sanitizeProject(item: unknown): Project | null {
     url,
     description: typeof p.description === 'string' ? p.description : undefined,
     screenshot: typeof p.screenshot === 'string' ? p.screenshot : undefined,
-    screenshotSource: ['automatic', 'uploaded', 'url', 'fallback'].includes(p.screenshotSource as string)
-      ? (p.screenshotSource as ScreenshotSource)
-      : 'automatic',
+    screenshotSource:
+      rawSource && ['automatic', 'uploaded', 'url', 'fallback'].includes(rawSource)
+        ? (rawSource as ScreenshotSource)
+        : 'automatic',
     category: typeof p.category === 'string' ? p.category : undefined,
     price: typeof p.price === 'string' ? p.price : undefined,
     technologies: Array.isArray(p.technologies)
       ? p.technologies.filter((t): t is string => typeof t === 'string' && Boolean(t.trim()))
       : undefined,
-    isPublished: typeof p.isPublished === 'boolean' ? p.isPublished : true,
-    ownerId: typeof p.ownerId === 'string' ? p.ownerId : undefined,
-    createdAt: toIsoDate(p.createdAt),
-    updatedAt: p.updatedAt ? toIsoDate(p.updatedAt) : undefined,
+    isPublished: typeof rawPublished === 'boolean' ? rawPublished : true,
+    ownerId: typeof rawOwner === 'string' ? rawOwner : undefined,
+    createdAt: toIsoDate(rawCreatedAt),
+    updatedAt: rawUpdatedAt ? toIsoDate(rawUpdatedAt) : undefined,
   };
 }
 
@@ -175,13 +186,27 @@ function buildFirestoreWritePayload(
   return payload;
 }
 
+function buildSupabaseRowPayload(project: Project): Record<string, unknown> {
+  return {
+    id: project.id,
+    name: project.name.slice(0, 120),
+    url: (project.url || '').slice(0, 500),
+    description: clampString(project.description, 1000) ?? null,
+    screenshot: project.screenshot ?? null,
+    screenshot_source: project.screenshotSource ?? 'automatic',
+    category: clampString(project.category, 80) ?? null,
+    price: clampString(project.price, 40) ?? null,
+    technologies: clampTechnologies(project.technologies) ?? [],
+    is_published: project.isPublished ?? true,
+  };
+}
+
 /**
- * Project repository service layer backed by Firebase Firestore with localStorage cache.
+ * Project repository service layer.
+ * Uses Supabase when VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY are configured,
+ * otherwise uses Firebase Firestore with localStorage cache fallback.
  */
 export const projectService = {
-  /**
-   * Synchronous cache read for instant initial render.
-   */
   getProjects(): Project[] {
     if (typeof window === 'undefined') {
       return [...SEED_PROJECTS];
@@ -218,18 +243,12 @@ export const projectService = {
     }
   },
 
-  /**
-   * Retrieves a single project from local cache by its unique ID.
-   */
   getProjectById(id: string): Project | null {
     if (!id) return null;
     const projects = this.getProjects();
     return projects.find((p) => p.id === id) || null;
   },
 
-  /**
-   * Updates localStorage cache.
-   */
   saveProjects(projects: Project[]): void {
     if (typeof window === 'undefined') return;
     try {
@@ -240,13 +259,47 @@ export const projectService = {
   },
 
   /**
-   * Real-time Firestore listener for published projects/products.
+   * Subscribes to real-time updates from Supabase (if configured) or Firestore.
    */
   subscribeProjects(
     onUpdate: (projects: Project[]) => void,
     onError?: (err: Error) => void,
     includeUnpublished = false
   ): Unsubscribe {
+    if (isSupabaseConfigured() && supabase) {
+      const client = supabase;
+      let active = true;
+
+      const loadSupabase = async () => {
+        try {
+          const items = await this.fetchProjectsFromCloud(includeUnpublished);
+          if (active) onUpdate(items);
+        } catch (err) {
+          if (active && onError && err instanceof Error) {
+            onError(err);
+          }
+        }
+      };
+
+      void loadSupabase();
+
+      const channel = client
+        .channel(`projects-changes-${includeUnpublished ? 'all' : 'pub'}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: PROJECTS_COLLECTION },
+          () => {
+            void loadSupabase();
+          }
+        )
+        .subscribe();
+
+      return () => {
+        active = false;
+        void client.removeChannel(channel);
+      };
+    }
+
     const colRef = collection(db, PROJECTS_COLLECTION);
     const q = includeUnpublished
       ? colRef
@@ -256,7 +309,6 @@ export const projectService = {
       q,
       (snapshot) => {
         if (snapshot.empty) {
-          // If Firestore collection is empty, keep showing seeded projects until admin writes
           onUpdate(this.getProjects());
           return;
         }
@@ -282,9 +334,38 @@ export const projectService = {
   },
 
   /**
-   * Fetches published projects from Firestore once.
+   * Fetches projects once from Supabase (if configured) or Firestore.
    */
-  async fetchProjectsFromCloud(): Promise<Project[]> {
+  async fetchProjectsFromCloud(includeUnpublished = false): Promise<Project[]> {
+    if (isSupabaseConfigured() && supabase) {
+      let queryBuilder = supabase
+        .from(PROJECTS_COLLECTION)
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!includeUnpublished) {
+        queryBuilder = queryBuilder.eq('is_published', true);
+      }
+
+      const { data, error } = await queryBuilder;
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      if (!data || data.length === 0) {
+        return this.getProjects();
+      }
+
+      const items = data
+        .map((row) => sanitizeProject(row))
+        .filter((p): p is Project => Boolean(p));
+
+      if (items.length > 0) {
+        this.saveProjects(items);
+      }
+      return items.length > 0 ? items : this.getProjects();
+    }
+
     try {
       const q = query(
         collection(db, PROJECTS_COLLECTION),
@@ -308,10 +389,24 @@ export const projectService = {
   },
 
   /**
-   * Fetches a single project document from Firestore by ID.
+   * Fetches a single project document by ID from Supabase or Firestore.
    */
   async fetchProjectByIdFromCloud(id: string): Promise<Project | null> {
     if (!id) return null;
+
+    if (isSupabaseConfigured() && supabase) {
+      const { data, error } = await supabase
+        .from(PROJECTS_COLLECTION)
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (!error && data) {
+        return sanitizeProject(data);
+      }
+      return this.getProjectById(id);
+    }
+
     const path = `${PROJECTS_COLLECTION}/${id}`;
     try {
       const snap = await getDoc(doc(db, PROJECTS_COLLECTION, id));
@@ -320,7 +415,6 @@ export const projectService = {
       }
       return this.getProjectById(id);
     } catch (error) {
-      // Fallback to local seed if offline or unavailable
       const cached = this.getProjectById(id);
       if (cached) return cached;
       handleFirestoreError(error, OperationType.GET, path);
@@ -328,7 +422,7 @@ export const projectService = {
   },
 
   /**
-   * Adds a new project or product locally and persists to Firestore.
+   * Adds a new project/product to Supabase (if configured) or Firestore.
    */
   async addProjectToCloud(
     data: Omit<Project, 'id' | 'createdAt'>,
@@ -339,6 +433,43 @@ export const projectService = {
     const finalName = rawName || (normalizedUrl ? deriveProjectName(normalizedUrl) : 'New Product');
     const slug = sanitizeId(finalName);
     const id = `${slug}-${Date.now().toString().slice(-4)}`.slice(0, 128);
+
+    let finalScreenshot = data.screenshot;
+    let finalScreenshotSource = data.screenshotSource;
+
+    if (isSupabaseConfigured() && supabase) {
+      if (finalScreenshot?.startsWith('data:image/')) {
+        const uploadedUrl = await uploadImageToSupabaseStorage(finalScreenshot, id);
+        if (uploadedUrl) {
+          finalScreenshot = uploadedUrl;
+          finalScreenshotSource = 'url';
+        }
+      }
+
+      const newProject: Project = {
+        ...data,
+        id,
+        name: finalName.slice(0, 120),
+        url: normalizedUrl.slice(0, 500),
+        screenshot: finalScreenshot,
+        screenshotSource: finalScreenshotSource,
+        isPublished: data.isPublished ?? true,
+        ownerId: ownerUid,
+        createdAt: new Date().toISOString(),
+      };
+
+      const { error } = await supabase
+        .from(PROJECTS_COLLECTION)
+        .insert(buildSupabaseRowPayload(newProject));
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      const current = this.getProjects();
+      this.saveProjects([newProject, ...current.filter((p) => p.id !== id)]);
+      return newProject;
+    }
 
     const newProject: Project = {
       ...data,
@@ -364,7 +495,7 @@ export const projectService = {
   },
 
   /**
-   * Updates an existing project/product in Firestore and local cache.
+   * Updates an existing project/product in Supabase or Firestore.
    */
   async updateProjectInCloud(
     id: string,
@@ -374,13 +505,26 @@ export const projectService = {
     const current = this.getProjects();
     const existing = current.find((p) => p.id === id);
 
+    let nextScreenshot =
+      updates.screenshot !== undefined ? updates.screenshot : existing?.screenshot;
+    let nextScreenshotSource =
+      updates.screenshotSource ?? existing?.screenshotSource ?? 'automatic';
+
+    if (isSupabaseConfigured() && supabase && nextScreenshot?.startsWith('data:image/')) {
+      const uploadedUrl = await uploadImageToSupabaseStorage(nextScreenshot, id);
+      if (uploadedUrl) {
+        nextScreenshot = uploadedUrl;
+        nextScreenshotSource = 'url';
+      }
+    }
+
     const merged: Project = {
       id,
       name: (updates.name !== undefined ? updates.name.trim() : existing?.name) || 'Untitled Product',
       url: updates.url !== undefined ? normalizeUrl(updates.url) : existing?.url || '',
       description: updates.description !== undefined ? updates.description : existing?.description,
-      screenshot: updates.screenshot !== undefined ? updates.screenshot : existing?.screenshot,
-      screenshotSource: updates.screenshotSource ?? existing?.screenshotSource ?? 'automatic',
+      screenshot: nextScreenshot,
+      screenshotSource: nextScreenshotSource,
       category: updates.category !== undefined ? updates.category : existing?.category,
       price: updates.price !== undefined ? updates.price : existing?.price,
       technologies: updates.technologies !== undefined ? updates.technologies : existing?.technologies,
@@ -390,12 +534,27 @@ export const projectService = {
       updatedAt: new Date().toISOString(),
     };
 
+    if (isSupabaseConfigured() && supabase) {
+      const { error } = await supabase
+        .from(PROJECTS_COLLECTION)
+        .upsert(buildSupabaseRowPayload(merged), { onConflict: 'id' });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      const next = existing
+        ? current.map((p) => (p.id === id ? merged : p))
+        : [merged, ...current];
+      this.saveProjects(next);
+      return merged;
+    }
+
     const docPath = `${PROJECTS_COLLECTION}/${id}`;
     try {
       const docRef = doc(db, PROJECTS_COLLECTION, id);
       const snap = await getDoc(docRef);
       if (!snap.exists()) {
-        // If it's one of the seed items not yet pushed to Firestore, create it cleanly
         const createPayload = buildFirestoreWritePayload(merged, ownerUid, true);
         await setDoc(docRef, createPayload);
       } else {
@@ -442,9 +601,19 @@ export const projectService = {
   },
 
   /**
-   * Deletes a project/product from Firestore and local cache.
+   * Deletes a project/product from Supabase or Firestore.
    */
   async deleteProjectFromCloud(id: string): Promise<boolean> {
+    if (isSupabaseConfigured() && supabase) {
+      const { error } = await supabase.from(PROJECTS_COLLECTION).delete().eq('id', id);
+      if (error) {
+        throw new Error(error.message);
+      }
+      const current = this.getProjects();
+      this.saveProjects(current.filter((p) => p.id !== id));
+      return true;
+    }
+
     const docPath = `${PROJECTS_COLLECTION}/${id}`;
     try {
       await deleteDoc(doc(db, PROJECTS_COLLECTION, id));
@@ -459,9 +628,25 @@ export const projectService = {
   },
 
   /**
-   * Seeds the 7 initial projects into Firestore (used on Reset to Seeds or initial cloud sync).
+   * Seeds the 7 initial projects into Supabase or Firestore.
    */
   async seedProjectsToCloud(ownerUid: string): Promise<Project[]> {
+    if (isSupabaseConfigured() && supabase) {
+      const rows = SEED_PROJECTS.map((item) =>
+        buildSupabaseRowPayload({ ...item, isPublished: true, ownerId: ownerUid })
+      );
+      const { error } = await supabase
+        .from(PROJECTS_COLLECTION)
+        .upsert(rows, { onConflict: 'id' });
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      this.saveProjects(SEED_PROJECTS);
+      return [...SEED_PROJECTS];
+    }
+
     try {
       const batch = writeBatch(db);
       for (const item of SEED_PROJECTS) {
@@ -482,10 +667,9 @@ export const projectService = {
     return [...SEED_PROJECTS];
   },
 
-  /**
-   * Ensures cloud Firestore has the initial 7 projects if collection is empty when admin connects.
-   */
   async ensureCloudSeeded(ownerUid: string): Promise<void> {
+    if (isSupabaseConfigured()) return;
+
     try {
       const snap = await getDocs(collection(db, PROJECTS_COLLECTION));
       if (snap.empty) {

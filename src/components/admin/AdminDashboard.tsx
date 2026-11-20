@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import type { User } from 'firebase/auth';
 import { Project } from '../../types';
 import { projectService, authService } from '../../services';
+import { isSupabaseConfigured } from '../../lib/supabase';
 import { ProjectForm, ProjectFormSubmitData } from './ProjectForm';
 import { DeleteProjectDialog } from './DeleteProjectDialog';
 import { Toast, ToastMessage } from './Toast';
@@ -48,45 +49,52 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
+  const usingSupabase = isSupabaseConfigured();
+
   useEffect(() => {
-    const unsubAuth = authService.subscribeFirebaseAuth(async (user) => {
-      setFirebaseUser(user);
-      if (user) {
-        try {
-          await projectService.ensureCloudSeeded(user.uid);
-        } catch {
-          // Handled via structured Firestore error if permission denied
-        }
-      }
-    });
+    const unsubAuth = usingSupabase
+      ? () => {}
+      : authService.subscribeFirebaseAuth(async (user) => {
+          setFirebaseUser(user);
+          if (user) {
+            try {
+              await projectService.ensureCloudSeeded(user.uid);
+            } catch {
+              // Handled via structured Firestore error if permission denied
+            }
+          }
+        });
 
     const unsubProjects = projectService.subscribeProjects(
       (cloudProjects) => {
         setProjects(cloudProjects);
       },
       () => {
-        // Fallback to local cache on listener error
         setProjects(projectService.getProjects());
       },
-      Boolean(firebaseUser)
+      usingSupabase || Boolean(firebaseUser)
     );
 
     return () => {
       unsubAuth();
       unsubProjects();
     };
-  }, [Boolean(firebaseUser)]);
+  }, [usingSupabase, Boolean(firebaseUser)]);
 
-  const ensureCloudSession = async (): Promise<User | null> => {
+  const ensureCloudOwnerUid = async (): Promise<string | null> => {
+    if (usingSupabase) {
+      return 'sameer-admin';
+    }
+
     const current = authService.getFirebaseUser();
-    if (current) return current;
+    if (current) return current.uid;
 
     setIsConnectingCloud(true);
     try {
       const user = await authService.connectCloudAdmin();
       await projectService.ensureCloudSeeded(user.uid);
       addToast('Cloud database authorized.', 'success');
-      return user;
+      return user.uid;
     } catch {
       addToast('Please sign in with your authorized Google account to save to the cloud database.', 'error');
       return null;
@@ -96,7 +104,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const handleConnectCloudClick = async () => {
-    await ensureCloudSession();
+    await ensureCloudOwnerUid();
   };
 
   const handleOpenAdd = () => {
@@ -112,22 +120,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleSaveProject = async (data: ProjectFormSubmitData) => {
     setIsSaving(true);
     try {
-      const user = await ensureCloudSession();
-      if (!user) {
+      const ownerUid = await ensureCloudOwnerUid();
+      if (!ownerUid) {
         return;
       }
 
       if (editingProject) {
-        await projectService.updateProjectInCloud(editingProject.id, data, user.uid);
+        await projectService.updateProjectInCloud(editingProject.id, data, ownerUid);
         addToast(`"${data.name}" updated in database.`, 'success');
       } else {
-        await projectService.addProjectToCloud(data, user.uid);
+        await projectService.addProjectToCloud(data, ownerUid);
         addToast(`"${data.name}" added to database.`, 'success');
       }
       setIsFormOpen(false);
     } catch (err) {
       console.error('Save error:', err);
-      addToast('Unable to save to database. Please verify your admin Google account.', 'error');
+      const msg = err instanceof Error ? err.message : '';
+      if (msg.toLowerCase().includes('row-level security')) {
+        addToast('Supabase RLS policy blocked write. Run the Supabase write policy SQL or sign in.', 'error');
+      } else {
+        addToast('Unable to save to database. Please verify your database connection.', 'error');
+      }
     } finally {
       setIsSaving(false);
     }
@@ -137,8 +150,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (!deletingProject) return;
     setIsSaving(true);
     try {
-      const user = await ensureCloudSession();
-      if (!user) return;
+      const ownerUid = await ensureCloudOwnerUid();
+      if (!ownerUid) return;
 
       await projectService.deleteProjectFromCloud(deletingProject.id);
       addToast(`"${deletingProject.name}" deleted from database.`, 'success');
@@ -153,10 +166,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleResetToSeed = async () => {
     setIsSaving(true);
     try {
-      const user = await ensureCloudSession();
-      if (!user) return;
+      const ownerUid = await ensureCloudOwnerUid();
+      if (!ownerUid) return;
 
-      const seeded = await projectService.seedProjectsToCloud(user.uid);
+      const seeded = await projectService.seedProjectsToCloud(ownerUid);
       setProjects(seeded);
       addToast('Restored original 7 portfolio projects in database.', 'info');
     } catch {
@@ -229,8 +242,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       {/* Main Dashboard Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 sm:py-12 space-y-6">
-        {/* Cloud Database Authorization Prompt (shown only until Google Admin is signed in) */}
-        {!firebaseUser && (
+        {/* Cloud Database Authorization Prompt (for Firestore mode when Google Admin is not yet signed in) */}
+        {!usingSupabase && !firebaseUser && (
           <div className="p-4 sm:p-5 rounded-2xl bg-sky-500/10 border border-sky-400/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div className="flex items-start gap-3">
               <div className="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/30 flex items-center justify-center text-sky-300 shrink-0">
