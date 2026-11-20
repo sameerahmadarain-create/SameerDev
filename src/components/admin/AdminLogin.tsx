@@ -177,7 +177,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess, onNaviga
           </form>
 
           <div className="pt-4 border-t border-white/[0.06] text-[11px] text-stone-400 text-center leading-relaxed font-mono">
-            Backed by Firebase Firestore cloud database.
+            Backed by Supabase PostgreSQL database.
           </div>
         </div>
       </div>

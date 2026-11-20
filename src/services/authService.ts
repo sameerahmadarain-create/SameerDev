@@ -1,16 +1,7 @@
-import {
-  onAuthStateChanged,
-  signInWithPopup,
-  signOut,
-  type User,
-} from 'firebase/auth';
-import { auth, googleAuthProvider } from '../lib/firebase';
-
 /**
  * Admin Authentication Service
  *
- * Uses client-side credential verification for the SameerDev admin gate
- * alongside Firebase Google Auth for cloud database write authorization.
+ * Manages SameerDev Admin Panel session state cleanly in one place.
  */
 
 const AUTH_STORAGE_KEY = 'sameerdev_admin_auth';
@@ -97,30 +88,5 @@ export const authService = {
     } catch (e) {
       console.warn('Unable to clear admin session:', e);
     }
-    void signOut(auth).catch(() => {
-      // Ignore Firebase sign-out errors during local logout
-    });
-  },
-
-  /**
-   * Authorizes Firebase Cloud Database write access via Google Sign-In popup.
-   */
-  async connectCloudAdmin(): Promise<User> {
-    const result = await signInWithPopup(auth, googleAuthProvider);
-    return result.user;
-  },
-
-  /**
-   * Returns current Firebase authenticated user if signed in.
-   */
-  getFirebaseUser(): User | null {
-    return auth.currentUser;
-  },
-
-  /**
-   * Subscribes to Firebase Auth state updates.
-   */
-  subscribeFirebaseAuth(callback: (user: User | null) => void): () => void {
-    return onAuthStateChanged(auth, callback);
   },
 };

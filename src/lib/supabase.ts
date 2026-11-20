@@ -1,20 +1,105 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim() || '';
-const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim() || '';
+export interface SupabaseConfigDiagnostics {
+  configured: boolean;
+  missingVars: string[];
+  error: string | null;
+  urlHost: string | null;
+}
 
-const isPlaceholder =
-  !supabaseUrl ||
-  !supabaseAnonKey ||
-  supabaseUrl.includes('YOUR_PROJECT_ID') ||
-  supabaseAnonKey.includes('YOUR_SUPABASE_ANON_KEY');
+const rawUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim() || '';
+const rawAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim() || '';
 
-export const supabase: SupabaseClient | null = !isPlaceholder
-  ? createClient(supabaseUrl, supabaseAnonKey)
+function isServiceRoleOrSecretKey(key: string): boolean {
+  if (!key) return false;
+  if (key.startsWith('sb_secret_')) return true;
+  const parts = key.split('.');
+  if (parts.length === 3) {
+    try {
+      const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const payload = JSON.parse(atob(base64)) as { role?: string };
+      if (payload?.role === 'service_role') {
+        return true;
+      }
+    } catch {
+      // Non-JWT or unreadable token format; ignore decode check
+    }
+  }
+  return false;
+}
+
+function evaluateSupabaseConfig(): SupabaseConfigDiagnostics {
+  const missingVars: string[] = [];
+
+  const urlIsPlaceholder = !rawUrl || rawUrl.includes('YOUR_PROJECT_ID');
+  const keyIsPlaceholder = !rawAnonKey || rawAnonKey.includes('YOUR_SUPABASE_ANON_KEY');
+
+  if (urlIsPlaceholder) {
+    missingVars.push('VITE_SUPABASE_URL');
+  }
+  if (keyIsPlaceholder) {
+    missingVars.push('VITE_SUPABASE_ANON_KEY');
+  }
+
+  if (missingVars.length > 0) {
+    return {
+      configured: false,
+      missingVars,
+      error: `Supabase configuration is missing at build time (${missingVars.join(', ')}). Configure these as Build Environment Variables in Cloudflare and redeploy.`,
+      urlHost: null,
+    };
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+    if (parsedUrl.protocol !== 'https:') {
+      return {
+        configured: false,
+        missingVars: [],
+        error: 'VITE_SUPABASE_URL must be a valid https:// URL.',
+        urlHost: null,
+      };
+    }
+  } catch {
+    return {
+      configured: false,
+      missingVars: [],
+      error: 'VITE_SUPABASE_URL is not a valid URL.',
+      urlHost: null,
+    };
+  }
+
+  if (isServiceRoleOrSecretKey(rawAnonKey)) {
+    return {
+      configured: false,
+      missingVars: [],
+      error:
+        'Security error: A Supabase service_role or secret key was provided to the frontend. Use only the public anon key in VITE_SUPABASE_ANON_KEY.',
+      urlHost: parsedUrl.hostname,
+    };
+  }
+
+  return {
+    configured: true,
+    missingVars: [],
+    error: null,
+    urlHost: parsedUrl.hostname,
+  };
+}
+
+const configDiagnostics = evaluateSupabaseConfig();
+
+export const supabase: SupabaseClient | null = configDiagnostics.configured
+  ? createClient(rawUrl, rawAnonKey)
   : null;
 
 export function isSupabaseConfigured(): boolean {
   return Boolean(supabase);
+}
+
+export function getSupabaseConfigDiagnostics(): SupabaseConfigDiagnostics {
+  return configDiagnostics;
 }
 
 /**
