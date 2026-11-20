@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import type { User } from 'firebase/auth';
 import { Project } from '../../types';
 import { projectService, authService } from '../../services';
-import { isSupabaseConfigured } from '../../lib/supabase';
+import { getSupabaseConfigDiagnostics } from '../../lib/supabase';
 import { ProjectForm, ProjectFormSubmitData } from './ProjectForm';
 import { DeleteProjectDialog } from './DeleteProjectDialog';
 import { Toast, ToastMessage } from './Toast';
@@ -17,7 +16,7 @@ import {
   RotateCcw,
   CheckCircle2,
   FolderOpen,
-  Cloud,
+  AlertTriangle,
   Tag,
   Image as ImageIcon,
 } from 'lucide-react';
@@ -31,13 +30,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLogout,
   onNavigateHome,
 }) => {
+  const supabaseDiagnostics = getSupabaseConfigDiagnostics();
   const [projects, setProjects] = useState<Project[]>(() => projectService.getProjects());
-  const [firebaseUser, setFirebaseUser] = useState<User | null>(() => authService.getFirebaseUser());
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [deletingProject, setDeletingProject] = useState<Project | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  const [isConnectingCloud, setIsConnectingCloud] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(supabaseDiagnostics.error);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const addToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
@@ -49,62 +48,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  const usingSupabase = isSupabaseConfigured();
-
   useEffect(() => {
-    const unsubAuth = usingSupabase
-      ? () => {}
-      : authService.subscribeFirebaseAuth(async (user) => {
-          setFirebaseUser(user);
-          if (user) {
-            try {
-              await projectService.ensureCloudSeeded(user.uid);
-            } catch {
-              // Handled via structured Firestore error if permission denied
-            }
-          }
-        });
-
     const unsubProjects = projectService.subscribeProjects(
       (cloudProjects) => {
         setProjects(cloudProjects);
+        if (supabaseDiagnostics.configured) {
+          setDbError(null);
+        }
       },
-      () => {
+      (err) => {
+        setDbError(err.message);
         setProjects(projectService.getProjects());
       },
-      usingSupabase || Boolean(firebaseUser)
+      true
     );
 
     return () => {
-      unsubAuth();
       unsubProjects();
     };
-  }, [usingSupabase, Boolean(firebaseUser)]);
+  }, [supabaseDiagnostics.configured]);
 
-  const ensureCloudOwnerUid = async (): Promise<string | null> => {
-    if (usingSupabase) {
-      return 'sameer-admin';
+  const assertConfiguredOrNotify = (): boolean => {
+    if (!supabaseDiagnostics.configured) {
+      const diagnosticMessage =
+        supabaseDiagnostics.error ||
+        'Supabase configuration is missing at build time (VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY).';
+      setDbError(diagnosticMessage);
+      addToast(diagnosticMessage, 'error');
+      return false;
     }
-
-    const current = authService.getFirebaseUser();
-    if (current) return current.uid;
-
-    setIsConnectingCloud(true);
-    try {
-      const user = await authService.connectCloudAdmin();
-      await projectService.ensureCloudSeeded(user.uid);
-      addToast('Cloud database authorized.', 'success');
-      return user.uid;
-    } catch {
-      addToast('Please sign in with your authorized Google account to save to the cloud database.', 'error');
-      return null;
-    } finally {
-      setIsConnectingCloud(false);
-    }
-  };
-
-  const handleConnectCloudClick = async () => {
-    await ensureCloudOwnerUid();
+    return true;
   };
 
   const handleOpenAdd = () => {
@@ -118,38 +91,42 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const handleSaveProject = async (data: ProjectFormSubmitData) => {
+    if (!assertConfiguredOrNotify()) {
+      return;
+    }
+
     setIsSaving(true);
     try {
-      const ownerUid = await ensureCloudOwnerUid();
-      if (!ownerUid) {
-        return;
-      }
-
       let savedProject: Project | null;
       if (editingProject) {
-        savedProject = await projectService.updateProjectInCloud(editingProject.id, data, ownerUid);
-        addToast(`"${data.name}" updated in database.`, 'success');
+        savedProject = await projectService.updateProjectInCloud(editingProject.id, data);
+        addToast(`"${data.name}" updated in Supabase.`, 'success');
       } else {
-        savedProject = await projectService.addProjectToCloud(data, ownerUid);
-        addToast(`"${data.name}" added to database.`, 'success');
+        savedProject = await projectService.addProjectToCloud(data);
+        addToast(`"${data.name}" added to Supabase.`, 'success');
       }
 
       // Update the dashboard immediately; do not depend on Realtime being enabled.
       if (savedProject) {
         setProjects((current) =>
           editingProject
-            ? current.map((project) => project.id === savedProject!.id ? savedProject! : project)
+            ? current.map((project) => (project.id === savedProject!.id ? savedProject! : project))
             : [savedProject!, ...current.filter((project) => project.id !== savedProject!.id)]
         );
       }
+      setDbError(null);
       setIsFormOpen(false);
     } catch (err) {
-      console.error('Save error:', err);
+      console.error('Supabase save error:', err);
       const msg = err instanceof Error ? err.message : '';
       if (msg.toLowerCase().includes('row-level security')) {
-        addToast('Supabase RLS policy blocked write. Run the Supabase write policy SQL or sign in.', 'error');
+        const rlsMsg = 'Supabase RLS policy blocked write. Check public.projects write policies in Supabase.';
+        setDbError(rlsMsg);
+        addToast(rlsMsg, 'error');
       } else {
-        addToast(msg || 'Unable to save to database. Please verify your database connection.', 'error');
+        const fallbackMsg = msg || 'Unable to save to Supabase. Please verify your database configuration.';
+        setDbError(fallbackMsg);
+        addToast(fallbackMsg, 'error');
       }
     } finally {
       setIsSaving(false);
@@ -158,15 +135,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleConfirmDelete = async () => {
     if (!deletingProject) return;
+    if (!assertConfiguredOrNotify()) {
+      setDeletingProject(null);
+      return;
+    }
+
+    const target = deletingProject;
     setIsSaving(true);
     try {
-      const ownerUid = await ensureCloudOwnerUid();
-      if (!ownerUid) return;
-
-      await projectService.deleteProjectFromCloud(deletingProject.id);
-      addToast(`"${deletingProject.name}" deleted from database.`, 'success');
-    } catch {
-      addToast('Unable to delete item from database.', 'error');
+      await projectService.deleteProjectFromCloud(target.id);
+      setProjects((current) => current.filter((project) => project.id !== target.id));
+      setDbError(null);
+      addToast(`"${target.name}" deleted from Supabase.`, 'success');
+    } catch (err) {
+      console.error('Supabase delete error:', err);
+      const msg = err instanceof Error ? err.message : 'Unable to delete item from Supabase.';
+      setDbError(msg);
+      addToast(msg, 'error');
     } finally {
       setIsSaving(false);
       setDeletingProject(null);
@@ -174,16 +159,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const handleResetToSeed = async () => {
+    if (!assertConfiguredOrNotify()) {
+      return;
+    }
+
     setIsSaving(true);
     try {
-      const ownerUid = await ensureCloudOwnerUid();
-      if (!ownerUid) return;
-
-      const seeded = await projectService.seedProjectsToCloud(ownerUid);
+      const seeded = await projectService.seedProjectsToCloud();
       setProjects(seeded);
-      addToast('Restored original 7 portfolio projects in database.', 'info');
-    } catch {
-      addToast('Unable to restore projects in database.', 'error');
+      setDbError(null);
+      addToast('Restored original 7 portfolio projects in Supabase.', 'info');
+    } catch (err) {
+      console.error('Supabase seed error:', err);
+      const msg = err instanceof Error ? err.message : 'Unable to restore projects in Supabase.';
+      setDbError(msg);
+      addToast(msg, 'error');
     } finally {
       setIsSaving(false);
     }
@@ -194,6 +184,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     addToast('Logged out successfully.', 'info');
     onLogout();
   };
+
+  const diagnosticBannerMessage = !supabaseDiagnostics.configured
+    ? supabaseDiagnostics.error
+    : dbError;
 
   return (
     <div className="min-h-screen bg-[#0d0907] text-white flex flex-col selection:bg-amber-500/30 selection:text-amber-200">
@@ -252,29 +246,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       {/* Main Dashboard Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 sm:py-12 space-y-6">
-        {/* Cloud Database Authorization Prompt (for Firestore mode when Google Admin is not yet signed in) */}
-        {!usingSupabase && !firebaseUser && (
-          <div className="p-4 sm:p-5 rounded-2xl bg-sky-500/10 border border-sky-400/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/30 flex items-center justify-center text-sky-300 shrink-0">
-                <Cloud className="w-4 h-4" />
-              </div>
-              <div className="space-y-0.5">
-                <h2 className="text-sm font-bold text-white">Authorize Cloud Database Sync</h2>
-                <p className="text-xs text-stone-300">
-                  Connect your authorized Google account to save new products and pictures directly to Firestore.
-                </p>
-              </div>
+        {/* Explicit Supabase Configuration / Connection Diagnostic Banner */}
+        {diagnosticBannerMessage && (
+          <div
+            role="alert"
+            className="p-4 sm:p-5 rounded-2xl bg-amber-500/10 border border-amber-400/35 flex items-start gap-3"
+          >
+            <div className="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-400/30 flex items-center justify-center text-amber-300 shrink-0 mt-0.5">
+              <AlertTriangle className="w-4 h-4" />
             </div>
-            <button
-              type="button"
-              onClick={handleConnectCloudClick}
-              disabled={isConnectingCloud}
-              className="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold text-stone-950 bg-sky-400 hover:bg-sky-300 btn-micro-fx disabled:opacity-60"
-            >
-              <Cloud className="w-3.5 h-3.5" />
-              <span>{isConnectingCloud ? 'Connecting...' : 'Connect Google Account'}</span>
-            </button>
+            <div className="space-y-1.5 min-w-0">
+              <h2 className="text-sm font-bold text-amber-200">
+                {!supabaseDiagnostics.configured
+                  ? 'Supabase Configuration Missing in Build'
+                  : 'Supabase Database Notice'}
+              </h2>
+              <p className="text-xs text-stone-200 leading-relaxed break-words">
+                {diagnosticBannerMessage}
+              </p>
+              {!supabaseDiagnostics.configured && supabaseDiagnostics.missingVars.length > 0 && (
+                <p className="text-[11px] font-mono text-amber-300/90">
+                  Missing at build time: {supabaseDiagnostics.missingVars.join(', ')}
+                </p>
+              )}
+            </div>
           </div>
         )}
 
