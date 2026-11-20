@@ -1,0 +1,150 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'sameerahmadarain@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Validation Blueprint: Project / Product Entity
+    function isValidProject(data, docId) {
+      return data.keys().hasAll(['id', 'name', 'url', 'isPublished', 'ownerId', 'createdAt'])
+        && data.keys().hasOnly([
+          'id',
+          'name',
+          'url',
+          'description',
+          'screenshot',
+          'screenshotSource',
+          'category',
+          'price',
+          'technologies',
+          'isPublished',
+          'ownerId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == docId
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.url is string && data.url.size() <= 500
+        && data.isPublished is bool
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128
+        && data.createdAt is timestamp
+        && (!('description' in data) || (data.description is string && data.description.size() <= 1000))
+        && (!('screenshot' in data) || (data.screenshot is string && data.screenshot.size() <= 700000))
+        && (!('screenshotSource' in data) || (data.screenshotSource in ['automatic', 'uploaded', 'url', 'fallback']))
+        && (!('category' in data) || (data.category is string && data.category.size() <= 80))
+        && (!('price' in data) || (data.price is string && data.price.size() <= 40))
+        && (!('technologies' in data) || (
+          data.technologies is list
+          && data.technologies.size() <= 12
+          && (data.technologies.size() == 0 || (data.technologies[0] is string && data.technologies[0].size() <= 50))
+        ))
+        && (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    // Validation Blueprint: Admin Entity
+    function isValidAdmin(data, docId) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'createdAt'])
+        && isValidId(data.uid)
+        && data.uid == docId
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && data.role == 'admin'
+        && data.createdAt is timestamp;
+    }
+
+    // Connectivity health probe document
+    match /test/{docId} {
+      allow get: if docId == 'connection';
+    }
+
+    // Portfolio Projects & Products Collection
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && (existing().isPublished == true || isAdmin());
+      allow list: if resource.data.isPublished == true || isAdmin();
+
+      allow create: if isAdmin()
+        && isValidId(projectId)
+        && isValidProject(incoming(), projectId)
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && (!('updatedAt' in incoming()) || incoming().updatedAt == request.time);
+
+      allow update: if isAdmin()
+        && isValidId(projectId)
+        && isValidProject(incoming(), projectId)
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'url',
+          'description',
+          'screenshot',
+          'screenshotSource',
+          'category',
+          'price',
+          'technologies',
+          'isPublished',
+          'updatedAt'
+        ]);
+
+      allow delete: if isAdmin() && isValidId(projectId);
+    }
+
+    // Admin Role Registry
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isVerifiedUser() && (request.auth.uid == adminId || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isAdmin()
+        && isValidId(adminId)
+        && isValidAdmin(incoming(), adminId)
+        && incoming().createdAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidId(adminId)
+        && isValidAdmin(incoming(), adminId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'role']);
+
+      allow delete: if isAdmin() && isValidId(adminId);
+    }
+  }
+}

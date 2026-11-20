@@ -1,0 +1,124 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "A portfolio project or digital product managed by the admin and displayed publicly.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique project/product identifier slug.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the project or product.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "url": {
+          "type": "string",
+          "description": "Optional HTTPS live demo or product URL.",
+          "maxLength": 500
+        },
+        "description": {
+          "type": "string",
+          "description": "Short summary describing the project or product.",
+          "maxLength": 1000
+        },
+        "screenshot": {
+          "type": "string",
+          "description": "Uploaded compressed image data URL or external HTTPS image URL.",
+          "maxLength": 700000
+        },
+        "screenshotSource": {
+          "type": "string",
+          "description": "Origin of the preview picture.",
+          "enum": ["automatic", "uploaded", "url", "fallback"]
+        },
+        "category": {
+          "type": "string",
+          "description": "Category label such as AI Web Tool, E-Commerce, or Product.",
+          "maxLength": 80
+        },
+        "price": {
+          "type": "string",
+          "description": "Optional product price tag.",
+          "maxLength": 40
+        },
+        "technologies": {
+          "type": "array",
+          "description": "List of up to 12 technologies or tags."
+        },
+        "isPublished": {
+          "type": "boolean",
+          "description": "Whether the project or product is publicly visible."
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Authenticated admin UID who created the record.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the record was last updated."
+        }
+      },
+      "required": ["id", "name", "url", "isPublished", "ownerId", "createdAt"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Authorized administrator role document mapped by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the administrator.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified administrator email address.",
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "description": "Role identifier.",
+          "enum": ["admin"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the admin entry was registered."
+        }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/projects/{projectId}": {
+      "schema": {
+        "$ref": "#/entities/Project"
+      },
+      "description": "Publicly readable portfolio projects and products, writable only by verified admins."
+    },
+    "/admins/{adminId}": {
+      "schema": {
+        "$ref": "#/entities/Admin"
+      },
+      "description": "Administrator registry for RBAC verification."
+    }
+  }
+}
