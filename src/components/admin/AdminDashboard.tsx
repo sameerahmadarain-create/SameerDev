@@ -125,12 +125,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         return;
       }
 
+      let savedProject: Project | null;
       if (editingProject) {
-        await projectService.updateProjectInCloud(editingProject.id, data, ownerUid);
+        savedProject = await projectService.updateProjectInCloud(editingProject.id, data, ownerUid);
         addToast(`"${data.name}" updated in database.`, 'success');
       } else {
-        await projectService.addProjectToCloud(data, ownerUid);
+        savedProject = await projectService.addProjectToCloud(data, ownerUid);
         addToast(`"${data.name}" added to database.`, 'success');
+      }
+
+      // Update the dashboard immediately; do not depend on Realtime being enabled.
+      if (savedProject) {
+        setProjects((current) =>
+          editingProject
+            ? current.map((project) => project.id === savedProject!.id ? savedProject! : project)
+            : [savedProject!, ...current.filter((project) => project.id !== savedProject!.id)]
+        );
       }
       setIsFormOpen(false);
     } catch (err) {
@@ -139,7 +149,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       if (msg.toLowerCase().includes('row-level security')) {
         addToast('Supabase RLS policy blocked write. Run the Supabase write policy SQL or sign in.', 'error');
       } else {
-        addToast('Unable to save to database. Please verify your database connection.', 'error');
+        addToast(msg || 'Unable to save to database. Please verify your database connection.', 'error');
       }
     } finally {
       setIsSaving(false);
